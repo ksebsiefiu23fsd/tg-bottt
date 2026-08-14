@@ -906,15 +906,20 @@ def bilingual_lyrics_chunks(original: str, translation: str, limit: int = 3600) 
     original_lines = original.splitlines()
     translated_lines = translation.splitlines()
     blocks: list[str] = []
+    section_separator = "----------------------------"
     for index, original_line in enumerate(original_lines):
         translated_line = translated_lines[index] if index < len(translated_lines) else ""
         if not original_line.strip() and not translated_line.strip():
-            blocks.append("")
+            if blocks and blocks[-1] != section_separator:
+                blocks.append(section_separator)
             continue
         blocks.append(
             f"<b>{html.escape(original_line)}</b>\n"
-            f" ↳ <i>{html.escape(translated_line)}</i>"
+            f"  <i>{html.escape(translated_line)}</i>"
         )
+
+    if blocks and blocks[-1] == section_separator:
+        blocks.pop()
 
     chunks: list[str] = []
     current: list[str] = []
