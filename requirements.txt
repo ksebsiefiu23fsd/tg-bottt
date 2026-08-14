@@ -1,6 +1,6 @@
 aiogram>=3.22,<4
 python-dotenv>=1.1,<2
-yt-dlp>=2025.7.21
+yt-dlp[default]>=2025.7.21
 imageio-ffmpeg>=0.6,<1
 shazamio>=0.8,<1; python_version < "3.14"
 curl-cffi==0.13.0
