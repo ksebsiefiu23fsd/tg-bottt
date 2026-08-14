@@ -94,6 +94,28 @@ def initialize_database() -> None:
             )
             """
         )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tracks (
+                track_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                artist TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS lyrics (
+                track_id TEXT PRIMARY KEY,
+                original TEXT NOT NULL,
+                language TEXT NOT NULL,
+                copyright TEXT NOT NULL,
+                translation TEXT,
+                FOREIGN KEY(track_id) REFERENCES tracks(track_id)
+            )
+            """
+        )
 
 
 def record_user(user_id: int) -> None:
@@ -125,6 +147,88 @@ def user_statistics() -> dict[str, int]:
             name: int(connection.execute(query).fetchone()[0])
             for name, query in queries.items()
         }
+
+
+def save_track(track_id: str, track: dict) -> None:
+    with sqlite3.connect(DATABASE_PATH) as connection:
+        connection.execute(
+            """
+            INSERT INTO tracks (track_id, title, artist)
+            VALUES (?, ?, ?)
+            ON CONFLICT(track_id) DO UPDATE SET
+                title = excluded.title,
+                artist = excluded.artist
+            """,
+            (track_id, track["title"], track.get("artist")),
+        )
+
+
+def load_track(track_id: str) -> dict | None:
+    with sqlite3.connect(DATABASE_PATH) as connection:
+        row = connection.execute(
+            "SELECT title, artist FROM tracks WHERE track_id = ?",
+            (track_id,),
+        ).fetchone()
+    return {"title": row[0], "artist": row[1]} if row else None
+
+
+def save_lyrics(track_id: str, lyrics: dict) -> None:
+    with sqlite3.connect(DATABASE_PATH) as connection:
+        connection.execute(
+            """
+            INSERT INTO lyrics (track_id, original, language, copyright, translation)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(track_id) DO UPDATE SET
+                original = excluded.original,
+                language = excluded.language,
+                copyright = excluded.copyright,
+                translation = excluded.translation
+            """,
+            (
+                track_id,
+                lyrics["original"],
+                lyrics["language"],
+                lyrics["copyright"],
+                lyrics.get("translation"),
+            ),
+        )
+
+
+def load_lyrics(track_id: str) -> dict | None:
+    with sqlite3.connect(DATABASE_PATH) as connection:
+        row = connection.execute(
+            """
+            SELECT original, language, copyright, translation
+            FROM lyrics WHERE track_id = ?
+            """,
+            (track_id,),
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        "original": row[0],
+        "language": row[1],
+        "copyright": row[2],
+        "translation": row[3],
+    }
+
+
+async def get_saved_track(track_id: str) -> dict | None:
+    track = downloaded_tracks.get(track_id)
+    if track is None:
+        track = await asyncio.to_thread(load_track, track_id)
+        if track:
+            downloaded_tracks[track_id] = track
+    return track
+
+
+async def get_saved_lyrics(track_id: str) -> dict | None:
+    lyrics = lyrics_cache.get(track_id)
+    if lyrics is None:
+        lyrics = await asyncio.to_thread(load_lyrics, track_id)
+        if lyrics:
+            lyrics_cache[track_id] = lyrics
+    return lyrics
 
 
 class UserTrackingMiddleware(BaseMiddleware):
@@ -985,10 +1089,12 @@ async def choose_search_result(callback: CallbackQuery) -> None:
                 return
             await status.edit_text("📤 Отправляю аудиофайл…")
             track_id = secrets.token_hex(6)
-            downloaded_tracks[track_id] = {
+            track = {
                 "title": title,
                 "artist": performer,
             }
+            downloaded_tracks[track_id] = track
+            await asyncio.to_thread(save_track, track_id, track)
             await callback.message.answer_audio(
                 audio=FSInputFile(audio_path, filename=f"{title}.mp3"),
                 title=title,
@@ -1021,7 +1127,7 @@ async def choose_search_result(callback: CallbackQuery) -> None:
 async def request_lyrics(callback: CallbackQuery) -> None:
     await callback.answer()
     track_id = (callback.data or "").split(":", 1)[1]
-    track = downloaded_tracks.get(track_id)
+    track = await get_saved_track(track_id)
     if not callback.message or not track:
         if callback.message:
             await callback.message.answer("Данные композиции устарели. Выполните поиск ещё раз.")
@@ -1038,6 +1144,7 @@ async def request_lyrics(callback: CallbackQuery) -> None:
             )
             return
         lyrics_cache[track_id] = lyrics
+        await asyncio.to_thread(save_lyrics, track_id, lyrics)
         await status.delete()
         if lyrics["language"] == "ru":
             lyrics_messages[track_id] = await send_long_text(
@@ -1062,9 +1169,13 @@ async def request_lyrics(callback: CallbackQuery) -> None:
 async def show_original_lyrics(callback: CallbackQuery) -> None:
     await callback.answer()
     track_id = (callback.data or "").split(":", 1)[1]
-    lyrics = lyrics_cache.get(track_id)
-    track = downloaded_tracks.get(track_id)
+    lyrics = await get_saved_lyrics(track_id)
+    track = await get_saved_track(track_id)
     if not callback.message or not lyrics or not track:
+        if callback.message:
+            await callback.message.answer(
+                "Данные этой композиции относятся к старой версии бота. Скачайте песню ещё раз, чтобы открыть текст и перевод."
+            )
         return
     await delete_lyrics_messages(track_id, callback.message)
     lyrics_messages[track_id] = await send_long_text(
@@ -1079,14 +1190,19 @@ async def show_original_lyrics(callback: CallbackQuery) -> None:
 async def show_translated_lyrics(callback: CallbackQuery) -> None:
     await callback.answer()
     track_id = (callback.data or "").split(":", 1)[1]
-    lyrics = lyrics_cache.get(track_id)
-    track = downloaded_tracks.get(track_id)
+    lyrics = await get_saved_lyrics(track_id)
+    track = await get_saved_track(track_id)
     if not callback.message or not lyrics or not track:
+        if callback.message:
+            await callback.message.answer(
+                "Данные этой композиции относятся к старой версии бота. Скачайте песню ещё раз, чтобы открыть перевод."
+            )
         return
     status = await callback.message.answer("🇷🇺 Перевожу текст…")
     try:
         if not lyrics.get("translation"):
             lyrics["translation"] = await translate_to_russian(lyrics["original"])
+            await asyncio.to_thread(save_lyrics, track_id, lyrics)
         await status.delete()
         await delete_lyrics_messages(track_id, callback.message)
         lyrics_messages[track_id] = await send_bilingual_lyrics(
