@@ -478,6 +478,58 @@ async def send_long_text(message: Message, heading: str, text: str, reply_markup
     return sent_messages
 
 
+def original_lyrics_chunks(lyrics: str, copyright_text: str = "", limit: int = 3600) -> list[str]:
+    blocks: list[str] = []
+    section_separator = "━" * 20
+    for line in lyrics.splitlines():
+        if not line.strip():
+            if blocks and blocks[-1] != section_separator:
+                blocks.append(section_separator)
+            continue
+        blocks.append(f"<b>{html.escape(line)}</b>")
+
+    if blocks and blocks[-1] == section_separator:
+        blocks.pop()
+    if copyright_text.strip():
+        blocks.append(html.escape(copyright_text.strip()))
+
+    chunks: list[str] = []
+    current: list[str] = []
+    current_size = 0
+    for block in blocks:
+        addition = len(block) + 1
+        if current and current_size + addition > limit:
+            chunks.append("\n".join(current))
+            current = []
+            current_size = 0
+        current.append(block)
+        current_size += addition
+    if current:
+        chunks.append("\n".join(current))
+    return chunks or [""]
+
+
+async def send_original_lyrics(
+    message: Message,
+    heading: str,
+    lyrics: str,
+    copyright_text: str = "",
+    reply_markup=None,
+) -> list[Message]:
+    chunks = original_lyrics_chunks(lyrics, copyright_text)
+    sent: list[Message] = []
+    for index, chunk in enumerate(chunks):
+        part = "" if index == 0 else f" — часть {index + 1}"
+        sent.append(
+            await message.answer(
+                f"{html.escape(heading + part)}\n\n{chunk}",
+                parse_mode="HTML",
+                reply_markup=reply_markup if index == len(chunks) - 1 else None,
+            )
+        )
+    return sent
+
+
 async def send_greeting_with_retry(message: Message, greeting: str) -> None:
     last_error: Exception | None = None
     for attempt in range(3):
@@ -1183,16 +1235,18 @@ async def request_lyrics(callback: CallbackQuery) -> None:
         await asyncio.to_thread(save_lyrics, track_id, lyrics)
         await status.delete()
         if lyrics["language"] == "ru":
-            lyrics_messages[track_id] = await send_long_text(
+            lyrics_messages[track_id] = await send_original_lyrics(
                 callback.message,
                 f"📝 {track['artist'] or ''} — {track['title']}",
-                f"{lyrics['original']}\n\n{lyrics['copyright']}",
+                lyrics["original"],
+                lyrics["copyright"],
             )
             return
-        lyrics_messages[track_id] = await send_long_text(
+        lyrics_messages[track_id] = await send_original_lyrics(
             callback.message,
             f"🇬🇧 {track['artist'] or ''} — {track['title']}",
-            f"{lyrics['original']}\n\n{lyrics['copyright']}",
+            lyrics["original"],
+            lyrics["copyright"],
             reply_markup=lyrics_switch_keyboard(track_id),
         )
     except Exception:
@@ -1214,10 +1268,11 @@ async def show_original_lyrics(callback: CallbackQuery) -> None:
             )
         return
     await delete_lyrics_messages(track_id, callback.message)
-    lyrics_messages[track_id] = await send_long_text(
+    lyrics_messages[track_id] = await send_original_lyrics(
         callback.message,
         f"🇬🇧 {track.get('artist') or ''} — {track['title']}",
-        f"{lyrics['original']}\n\n{lyrics['copyright']}",
+        lyrics["original"],
+        lyrics["copyright"],
         reply_markup=lyrics_switch_keyboard(track_id),
     )
 
