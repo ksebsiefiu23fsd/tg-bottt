@@ -7,6 +7,7 @@ import re
 import secrets
 import json
 import shutil
+import sqlite3
 import subprocess
 import tempfile
 import threading
@@ -16,9 +17,9 @@ from urllib.parse import urlparse
 import imageio_ffmpeg
 import certifi
 from aiohttp import ClientSession
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramNetworkError
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     CallbackQuery,
     BotCommand,
@@ -76,6 +77,65 @@ lyrics_messages: dict[str, list[Message]] = {}
 active_cancel_event: threading.Event | None = None
 WELCOME_IMAGE = Path(__file__).parent / "assets" / "welcome-image.jpg"
 WORK_STICKERS_FILE = Path(__file__).parent / "work-stickers.json"
+DATABASE_PATH = Path(__file__).parent / "data" / "bot.sqlite3"
+
+
+def initialize_database() -> None:
+    DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(DATABASE_PATH) as connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                first_seen TEXT NOT NULL,
+                last_seen TEXT NOT NULL,
+                interaction_count INTEGER NOT NULL DEFAULT 1,
+                is_allowed INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+
+
+def record_user(user_id: int) -> None:
+    with sqlite3.connect(DATABASE_PATH) as connection:
+        connection.execute(
+            """
+            INSERT INTO users (user_id, first_seen, last_seen, interaction_count, is_allowed)
+            VALUES (?, datetime('now'), datetime('now'), 1, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                last_seen = datetime('now'),
+                interaction_count = users.interaction_count + 1,
+                is_allowed = excluded.is_allowed
+            """,
+            (user_id, int(user_id == ALLOWED_USER_ID)),
+        )
+
+
+def user_statistics() -> dict[str, int]:
+    queries = {
+        "total": "SELECT COUNT(*) FROM users",
+        "allowed": "SELECT COUNT(*) FROM users WHERE is_allowed = 1",
+        "today": "SELECT COUNT(*) FROM users WHERE first_seen >= date('now')",
+        "week": "SELECT COUNT(*) FROM users WHERE first_seen >= datetime('now', '-7 days')",
+        "active_month": "SELECT COUNT(*) FROM users WHERE last_seen >= datetime('now', '-30 days')",
+        "interactions": "SELECT COALESCE(SUM(interaction_count), 0) FROM users",
+    }
+    with sqlite3.connect(DATABASE_PATH) as connection:
+        return {
+            name: int(connection.execute(query).fetchone()[0])
+            for name, query in queries.items()
+        }
+
+
+class UserTrackingMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        user = data.get("event_from_user")
+        if user:
+            try:
+                await asyncio.to_thread(record_user, user.id)
+            except Exception:
+                logging.exception("Unable to record bot user")
+        return await handler(event, data)
 
 
 def load_work_stickers() -> list[str]:
@@ -784,6 +844,24 @@ async def delete_lyrics_messages(track_id: str, current: Message | None = None) 
         await delete_message_safely(item)
 
 
+@router.message(Command("stats"))
+async def show_statistics(message: Message) -> None:
+    if not allowed(message):
+        await message.answer("У вас нет доступа к статистике.")
+        return
+    stats = await asyncio.to_thread(user_statistics)
+    await message.answer(
+        "📊 <b>Статистика бота</b>\n\n"
+        f"👥 Всего пользователей: <b>{stats['total']}</b>\n"
+        f"✅ С разрешённым доступом: <b>{stats['allowed']}</b>\n"
+        f"🆕 Новых сегодня: <b>{stats['today']}</b>\n"
+        f"📅 Новых за 7 дней: <b>{stats['week']}</b>\n"
+        f"🟢 Активных за 30 дней: <b>{stats['active_month']}</b>\n"
+        f"💬 Всего взаимодействий: <b>{stats['interactions']}</b>",
+        parse_mode="HTML",
+    )
+
+
 @router.message(CommandStart())
 async def start(message: Message) -> None:
     if not allowed(message):
@@ -1370,6 +1448,7 @@ async def main() -> None:
     if not BOT_TOKEN or BOT_TOKEN == "ADD_TOKEN_HERE":
         raise RuntimeError("Добавьте BOT_TOKEN в файл .env")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+    initialize_database()
     bot = Bot(BOT_TOKEN)
     await bot.set_my_description(
         description=(
@@ -1380,9 +1459,11 @@ async def main() -> None:
     await bot.set_my_commands(
         commands=[
             BotCommand(command="start", description="Запуск"),
+            BotCommand(command="stats", description="Статистика пользователей"),
         ]
     )
     dispatcher = Dispatcher()
+    dispatcher.update.outer_middleware(UserTrackingMiddleware())
     dispatcher.include_router(router)
     await bot.delete_webhook(drop_pending_updates=False)
     await dispatcher.start_polling(bot)

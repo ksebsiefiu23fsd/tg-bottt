@@ -14,3 +14,7 @@ fix_wireguard.sh
 top5-vps-contact.jpg
 top5-vps-video.mp4
 *.vtt
+data/*.db
+data/*.db-*
+data/*.sqlite3
+data/*.sqlite3-*
