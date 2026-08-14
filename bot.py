@@ -313,13 +313,22 @@ async def send_greeting_with_retry(message: Message, greeting: str) -> None:
         raise last_error
 
 
-def ffmpeg_dir(target_dir: Path) -> Path:
+def ffmpeg_executable(target_dir: Path) -> Path:
+    system_ffmpeg = shutil.which("ffmpeg")
+    if system_ffmpeg:
+        return Path(system_ffmpeg)
+
     directory = target_dir / "ffmpeg"
     directory.mkdir(exist_ok=True)
-    executable = directory / "ffmpeg.exe"
+    bundled = Path(imageio_ffmpeg.get_ffmpeg_exe())
+    executable = directory / bundled.name
     if not executable.exists():
-        shutil.copy2(imageio_ffmpeg.get_ffmpeg_exe(), executable)
-    return directory
+        shutil.copy2(bundled, executable)
+    return executable
+
+
+def ffmpeg_location(target_dir: Path) -> str:
+    return str(ffmpeg_executable(target_dir))
 
 
 def download_video(
@@ -328,7 +337,6 @@ def download_video(
     cancel_event: threading.Event,
     height: int = 1080,
 ) -> tuple[Path, str, int | None]:
-    ffmpeg = ffmpeg_dir(target_dir)
     common = {
         "quiet": True,
         "no_warnings": True,
@@ -348,7 +356,7 @@ def download_video(
         ),
         "merge_output_format": "mp4",
         "outtmpl": str(target_dir / "video.%(ext)s"),
-        "ffmpeg_location": str(ffmpeg),
+        "ffmpeg_location": ffmpeg_location(target_dir),
         "overwrites": True,
     }
     with YoutubeDL(options) as ydl:
@@ -381,7 +389,7 @@ def download_audio(url: str, target_dir: Path, cancel_event: threading.Event) ->
         "retries": 5,
         "extractor_retries": 5,
         "outtmpl": str(target_dir / "source.%(ext)s"),
-        "ffmpeg_location": str(ffmpeg_dir(target_dir)),
+        "ffmpeg_location": ffmpeg_location(target_dir),
         "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "128"}],
         "overwrites": True,
         "progress_hooks": [cancellation_hook(cancel_event)],
@@ -401,7 +409,7 @@ def download_audio(url: str, target_dir: Path, cancel_event: threading.Event) ->
 
 def extract_audio(video_path: Path, target_dir: Path) -> Path:
     output = target_dir / "uploaded.mp3"
-    executable = ffmpeg_dir(target_dir) / "ffmpeg.exe"
+    executable = ffmpeg_executable(target_dir)
     result = subprocess.run(
         [str(executable), "-y", "-i", str(video_path), "-vn", "-t", "120", "-ac", "1", "-ar", "44100", "-b:a", "128k", str(output)],
         capture_output=True,
@@ -479,7 +487,7 @@ def download_selected_track(
         "retries": 5,
         "extractor_retries": 5,
         "outtmpl": str(target_dir / "track.%(ext)s"),
-        "ffmpeg_location": str(ffmpeg_dir(target_dir)),
+        "ffmpeg_location": ffmpeg_location(target_dir),
         "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}],
         "overwrites": True,
         "progress_hooks": [cancellation_hook(cancel_event)],

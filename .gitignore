@@ -1,0 +1,16 @@
+.env
+.venv/
+.venv311/
+.venv313/
+.backup/
+__pycache__/
+.argos/
+.server-ssh/
+*.py[cod]
+downloads/
+work-stickers.json
+music-searches.json
+fix_wireguard.sh
+top5-vps-contact.jpg
+top5-vps-video.mp4
+*.vtt
