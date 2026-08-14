@@ -28,6 +28,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     Message,
     ReplyKeyboardRemove,
+    BotCommandScopeChat,
 )
 from dotenv import load_dotenv
 from yt_dlp import YoutubeDL
@@ -66,7 +67,7 @@ ARGOS_SOURCE_LANGUAGE = os.getenv("ARGOS_SOURCE_LANGUAGE", "en").strip()
 ARGOS_TARGET_LANGUAGE = os.getenv("ARGOS_TARGET_LANGUAGE", "ru").strip()
 
 router = Router()
-processing_lock = asyncio.Lock()
+processing_locks: dict[int, asyncio.Lock] = {}
 user_modes: dict[int, str] = {}
 music_search_results: dict[int, list[dict]] = {}
 MUSIC_SEARCHES_FILE = Path(__file__).parent / "music-searches.json"
@@ -74,7 +75,7 @@ pending_video_urls: dict[int, str] = {}
 downloaded_tracks: dict[str, dict] = {}
 lyrics_cache: dict[str, dict] = {}
 lyrics_messages: dict[str, list[Message]] = {}
-active_cancel_event: threading.Event | None = None
+active_cancel_events: dict[int, threading.Event] = {}
 WELCOME_IMAGE = Path(__file__).parent / "assets" / "welcome-image.jpg"
 WORK_STICKERS_FILE = Path(__file__).parent / "work-stickers.json"
 DATABASE_PATH = Path(__file__).parent / "data" / "bot.sqlite3"
@@ -346,6 +347,10 @@ MUSIC_LINK_DOMAINS = ("youtube.com", "youtu.be", "tiktok.com")
 
 
 def allowed(message: Message) -> bool:
+    return bool(message.from_user)
+
+
+def is_admin(message: Message) -> bool:
     return bool(message.from_user and message.from_user.id == ALLOWED_USER_ID)
 
 
@@ -399,24 +404,28 @@ def cancellation_hook(cancel_event: threading.Event):
 
 
 def reset_user_session(user_id: int) -> None:
-    global active_cancel_event, processing_lock
-    if active_cancel_event:
-        active_cancel_event.set()
-    if processing_lock.locked():
-        logging.info("Resetting media processing lock after /start")
-        processing_lock = asyncio.Lock()
-    active_cancel_event = None
+    cancel_event = active_cancel_events.pop(user_id, None)
+    if cancel_event:
+        cancel_event.set()
+    lock = processing_locks.get(user_id)
+    if lock and lock.locked():
+        logging.info("Resetting media processing lock for user %s after /start", user_id)
+        processing_locks[user_id] = asyncio.Lock()
     user_modes.pop(user_id, None)
     pending_video_urls.pop(user_id, None)
-    downloaded_tracks.clear()
-    lyrics_cache.clear()
-    lyrics_messages.clear()
 
 
-def begin_processing() -> threading.Event:
-    global active_cancel_event
-    active_cancel_event = threading.Event()
-    return active_cancel_event
+def get_processing_lock(user_id: int) -> asyncio.Lock:
+    return processing_locks.setdefault(user_id, asyncio.Lock())
+
+
+def begin_processing(user_id: int) -> threading.Event:
+    previous = active_cancel_events.get(user_id)
+    if previous:
+        previous.set()
+    cancel_event = threading.Event()
+    active_cancel_events[user_id] = cancel_event
+    return cancel_event
 
 
 async def delete_later(message: Message, delay: int = 8) -> None:
@@ -954,14 +963,14 @@ async def delete_lyrics_messages(track_id: str, current: Message | None = None) 
 
 @router.message(Command("stats"))
 async def show_statistics(message: Message) -> None:
-    if not allowed(message):
+    if not is_admin(message):
         await message.answer("У вас нет доступа к статистике.")
         return
     stats = await asyncio.to_thread(user_statistics)
     await message.answer(
         "📊 <b>Статистика бота</b>\n\n"
         f"👥 Всего пользователей: <b>{stats['total']}</b>\n"
-        f"✅ С разрешённым доступом: <b>{stats['allowed']}</b>\n"
+        f"🛡 Администраторов: <b>{stats['allowed']}</b>\n"
         f"🆕 Новых сегодня: <b>{stats['today']}</b>\n"
         f"📅 Новых за 7 дней: <b>{stats['week']}</b>\n"
         f"🟢 Активных за 30 дней: <b>{stats['active_month']}</b>\n"
@@ -990,7 +999,7 @@ async def start(message: Message) -> None:
 
 @router.message(F.sticker)
 async def register_work_sticker(message: Message) -> None:
-    if not allowed(message) or not message.sticker:
+    if not is_admin(message) or not message.sticker:
         return
     file_id = message.sticker.file_id
     if file_id not in work_stickers:
@@ -1064,13 +1073,15 @@ async def choose_search_result(callback: CallbackQuery) -> None:
         return
     if not callback.message:
         return
+    user_id = callback.from_user.id
+    processing_lock = get_processing_lock(user_id)
     if processing_lock.locked():
         await callback.message.answer("Предыдущий файл ещё обрабатывается. Попробуйте чуть позже.")
         return
 
     work_sticker = await send_work_sticker(callback.message)
     status = await callback.message.answer("⬇️ Скачиваю выбранную композицию…")
-    cancel_event = begin_processing()
+    cancel_event = begin_processing(user_id)
     async with processing_lock:
         temp_path = Path(tempfile.mkdtemp(prefix="music_track_"))
         try:
@@ -1289,12 +1300,14 @@ async def process_music_link(message: Message, url: str) -> None:
     if not is_url_for(url, MUSIC_LINK_DOMAINS):
         await message.answer("Для поиска музыки пришлите ссылку на YouTube или TikTok.")
         return
+    user_id = message.from_user.id if message.from_user else 0
+    processing_lock = get_processing_lock(user_id)
     if processing_lock.locked():
         await message.answer("Предыдущий файл ещё обрабатывается. Попробуйте чуть позже.")
         return
     work_sticker = await send_work_sticker(message)
     status = await message.answer("⬇️ Загружаю аудиодорожку…")
-    cancel_event = begin_processing()
+    cancel_event = begin_processing(user_id)
     async with processing_lock:
         temp_path = Path(tempfile.mkdtemp(prefix="music_bot_"))
         try:
@@ -1329,12 +1342,14 @@ async def process_uploaded_mp4(message: Message) -> None:
     if mime_type != "video/mp4" and not file_name.endswith(".mp4"):
         await message.answer("Поддерживается видео только в формате MP4.")
         return
+    user_id = message.from_user.id if message.from_user else 0
+    processing_lock = get_processing_lock(user_id)
     if processing_lock.locked():
         await message.answer("Предыдущий файл ещё обрабатывается. Попробуйте чуть позже.")
         return
     work_sticker = await send_work_sticker(message)
     status = await message.answer("⬇️ Загружаю MP4…")
-    cancel_event = begin_processing()
+    cancel_event = begin_processing(user_id)
     async with processing_lock:
         temp_path = Path(tempfile.mkdtemp(prefix="music_upload_"))
         try:
@@ -1364,12 +1379,14 @@ async def process_video_download(
     url: str,
     height: int,
 ) -> None:
+    user_id = message.from_user.id if message.from_user else 0
+    processing_lock = get_processing_lock(user_id)
     if processing_lock.locked():
         await message.answer("Предыдущий файл ещё обрабатывается. Нажмите /start для сброса.")
         return
     work_sticker = await send_work_sticker(message)
     status = await message.answer(f"⬇️ Скачиваю видео до {height}p…")
-    cancel_event = begin_processing()
+    cancel_event = begin_processing(user_id)
     async with processing_lock:
         temp_path = Path(tempfile.mkdtemp(prefix="video_bot_"))
         try:
@@ -1424,12 +1441,14 @@ async def process_video_download(
 
 
 async def process_video_audio_download(message: Message, url: str) -> None:
+    user_id = message.from_user.id if message.from_user else 0
+    processing_lock = get_processing_lock(user_id)
     if processing_lock.locked():
         await message.answer("Предыдущий файл ещё обрабатывается. Нажмите /start для сброса.")
         return
     work_sticker = await send_work_sticker(message)
     status = await message.answer("🎵 Извлекаю аудио в MP3…")
-    cancel_event = begin_processing()
+    cancel_event = begin_processing(user_id)
     async with processing_lock:
         temp_path = Path(tempfile.mkdtemp(prefix="video_audio_"))
         try:
@@ -1528,7 +1547,7 @@ async def handle_text(message: Message) -> None:
             return
         work_sticker = await send_work_sticker(message)
         status = await message.answer("🔎 Ищу композиции…")
-        cancel_event = begin_processing()
+        cancel_event = begin_processing(message.from_user.id if message.from_user else 0)
         try:
             entries = await asyncio.to_thread(search_music, text)
             if cancel_event.is_set():
@@ -1579,8 +1598,14 @@ async def main() -> None:
     await bot.set_my_commands(
         commands=[
             BotCommand(command="start", description="Запуск"),
-            BotCommand(command="stats", description="Статистика пользователей"),
         ]
+    )
+    await bot.set_my_commands(
+        commands=[
+            BotCommand(command="start", description="Запуск"),
+            BotCommand(command="stats", description="Статистика пользователей"),
+        ],
+        scope=BotCommandScopeChat(chat_id=ALLOWED_USER_ID),
     )
     dispatcher = Dispatcher()
     dispatcher.update.outer_middleware(UserTrackingMiddleware())
