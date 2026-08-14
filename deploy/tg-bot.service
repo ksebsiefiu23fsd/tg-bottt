@@ -1,0 +1,18 @@
+[Unit]
+Description=Telegram media bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/tg-bot
+EnvironmentFile=/opt/tg-bot/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/tg-bot/.venv/bin/python /opt/tg-bot/bot.py
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
