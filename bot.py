@@ -903,8 +903,8 @@ def bilingual_lyrics_chunks(original: str, translation: str, limit: int = 3600) 
             blocks.append("")
             continue
         blocks.append(
-            f"{html.escape(original_line)}\n"
-            f"  <i>{html.escape(translated_line)}</i>"
+            f"<b>{html.escape(original_line)}</b>\n"
+            f" ↳ <i>{html.escape(translated_line)}</i>"
         )
 
     chunks: list[str] = []
@@ -913,13 +913,13 @@ def bilingual_lyrics_chunks(original: str, translation: str, limit: int = 3600) 
     for block in blocks:
         addition = len(block) + 2
         if current and current_size + addition > limit:
-            chunks.append("\n\n".join(current))
+            chunks.append("\n".join(current))
             current = []
             current_size = 0
         current.append(block)
         current_size += addition
     if current:
-        chunks.append("\n\n".join(current))
+        chunks.append("\n".join(current))
     return chunks or [""]
 
 
