@@ -1,4 +1,5 @@
 import asyncio
+from difflib import SequenceMatcher
 import html
 import logging
 import os
@@ -71,6 +72,7 @@ MUSIC_SEARCHES_FILE = Path(__file__).parent / "music-searches.json"
 pending_video_urls: dict[int, str] = {}
 downloaded_tracks: dict[str, dict] = {}
 lyrics_cache: dict[str, dict] = {}
+lyrics_messages: dict[str, list[Message]] = {}
 active_cancel_event: threading.Event | None = None
 WELCOME_IMAGE = Path(__file__).parent / "assets" / "welcome-image.jpg"
 WORK_STICKERS_FILE = Path(__file__).parent / "work-stickers.json"
@@ -240,6 +242,7 @@ def reset_user_session(user_id: int) -> None:
     pending_video_urls.pop(user_id, None)
     downloaded_tracks.clear()
     lyrics_cache.clear()
+    lyrics_messages.clear()
 
 
 def begin_processing() -> threading.Event:
@@ -284,11 +287,18 @@ def split_text(text: str, limit: int = 3800) -> list[str]:
     return chunks or [text]
 
 
-async def send_long_text(message: Message, heading: str, text: str, reply_markup=None) -> None:
+async def send_long_text(message: Message, heading: str, text: str, reply_markup=None) -> list[Message]:
     chunks = split_text(text)
+    sent_messages: list[Message] = []
     for index, chunk in enumerate(chunks):
         prefix = f"{heading}\n\n" if index == 0 else f"{heading} — часть {index + 1}\n\n"
-        await message.answer(prefix + chunk, reply_markup=reply_markup if index == len(chunks) - 1 else None)
+        sent_messages.append(
+            await message.answer(
+                prefix + chunk,
+                reply_markup=reply_markup if index == len(chunks) - 1 else None,
+            )
+        )
+    return sent_messages
 
 
 async def send_greeting_with_retry(message: Message, greeting: str) -> None:
@@ -538,27 +548,114 @@ def lyrics_switch_keyboard(track_id: str) -> InlineKeyboardMarkup:
 
 
 async def fetch_lyrics(title: str, artist: str | None) -> dict | None:
-    params = {"track_name": title, "artist_name": artist or ""}
-    async with ClientSession() as session:
-        async with session.get(
-            f"{LRCLIB_API_URL}/search",
-            params=params,
-            timeout=30,
-        ) as response:
-            if response.status != 200:
-                raise RuntimeError(f"LRCLIB вернул ошибку {response.status}")
-            data = await response.json()
-    if not isinstance(data, list) or not data:
+    clean_title = clean_track_name(title)
+    clean_artist = clean_artist_name(artist or "")
+    queries = [
+        {"track_name": clean_title, "artist_name": clean_artist},
+        {"q": f"{clean_artist} {clean_title}".strip()},
+    ]
+    if clean_title.casefold() != title.casefold():
+        queries.append({"track_name": title, "artist_name": clean_artist})
+
+    candidates: dict[str, dict] = {}
+    headers = {"User-Agent": "SkachaykaMediaBot/1.0 (https://github.com/ksebsiefiu23fsd/tg-bottt)"}
+    async with ClientSession(headers=headers) as session:
+        for index, params in enumerate(queries):
+            async with session.get(
+                f"{LRCLIB_API_URL}/search",
+                params=params,
+                timeout=30,
+            ) as response:
+                if response.status == 429:
+                    raise RuntimeError("LRCLIB временно ограничил частоту запросов")
+                if response.status != 200:
+                    raise RuntimeError(f"LRCLIB вернул ошибку {response.status}")
+                data = await response.json()
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict):
+                        candidates[str(item.get("id") or id(item))] = item
+            if index + 1 < len(queries):
+                await asyncio.sleep(0.25)
+
+    ranked = sorted(
+        candidates.values(),
+        key=lambda item: lyrics_match_score(item, clean_title, clean_artist),
+        reverse=True,
+    )
+    lyrics = next((item for item in ranked if lyrics_body(item)), None)
+    if lyrics is None:
         return None
-    lyrics = data[0]
-    body = (lyrics.get("plainLyrics") or "").strip()
-    if not body:
-        return None
+    body = lyrics_body(lyrics)
     return {
         "original": body,
         "language": "ru" if re.search(r"[А-Яа-яЁё]", body) else "en",
         "copyright": "Источник текста: LRCLIB",
+        "matched_title": lyrics.get("trackName"),
+        "matched_artist": lyrics.get("artistName"),
     }
+
+
+def clean_track_name(value: str) -> str:
+    value = html.unescape(value).strip()
+    value = re.sub(
+        r"\s*[\[(](?:[^\])]*(?:official|video|audio|lyrics?|visuali[sz]er|remaster|live)[^\])]*)[\])]",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    )
+    value = re.sub(
+        r"\s*[-–—|]\s*(?:official\s+)?(?:music\s+)?(?:video|audio|lyrics?|visuali[sz]er)\s*$",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    )
+    return re.sub(r"\s+", " ", value).strip(" -–—|")
+
+
+def clean_artist_name(value: str) -> str:
+    value = html.unescape(value).strip()
+    value = re.sub(r"\s*[-–—]\s*Topic\s*$", "", value, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def comparable(value: str) -> str:
+    value = clean_track_name(value).casefold()
+    return re.sub(r"[^\w]+", " ", value, flags=re.UNICODE).strip()
+
+
+def text_similarity(left: str, right: str) -> float:
+    left_value = comparable(left)
+    right_value = comparable(right)
+    if not left_value or not right_value:
+        return 0.0
+    sequence = SequenceMatcher(None, left_value, right_value).ratio()
+    left_words = set(left_value.split())
+    right_words = set(right_value.split())
+    overlap = len(left_words & right_words) / max(len(left_words | right_words), 1)
+    return sequence * 0.65 + overlap * 0.35
+
+
+def lyrics_match_score(item: dict, title: str, artist: str) -> float:
+    score = text_similarity(str(item.get("trackName") or ""), title) * 0.72
+    if artist:
+        score += text_similarity(str(item.get("artistName") or ""), artist) * 0.28
+    if item.get("instrumental"):
+        score -= 1.0
+    if lyrics_body(item):
+        score += 0.1
+    return score
+
+
+def lyrics_body(item: dict) -> str:
+    plain = str(item.get("plainLyrics") or "").strip()
+    if plain:
+        return plain
+    synced = str(item.get("syncedLyrics") or "").strip()
+    if not synced:
+        return ""
+    lines = [re.sub(r"^(?:\[\d{1,2}:\d{2}(?:\.\d+)?\])+\s*", "", line) for line in synced.splitlines()]
+    return "\n".join(lines).strip()
 
 
 def translate_with_argos(text: str) -> str:
@@ -620,6 +717,65 @@ def translate_with_argos(text: str) -> str:
 
 async def translate_to_russian(text: str) -> str:
     return await asyncio.to_thread(translate_with_argos, text)
+
+
+def bilingual_lyrics_chunks(original: str, translation: str, limit: int = 3600) -> list[str]:
+    original_lines = original.splitlines()
+    translated_lines = translation.splitlines()
+    blocks: list[str] = []
+    for index, original_line in enumerate(original_lines):
+        translated_line = translated_lines[index] if index < len(translated_lines) else ""
+        if not original_line.strip() and not translated_line.strip():
+            blocks.append("")
+            continue
+        blocks.append(
+            f"{html.escape(original_line)}\n"
+            f"  <i>{html.escape(translated_line)}</i>"
+        )
+
+    chunks: list[str] = []
+    current: list[str] = []
+    current_size = 0
+    for block in blocks:
+        addition = len(block) + 2
+        if current and current_size + addition > limit:
+            chunks.append("\n\n".join(current))
+            current = []
+            current_size = 0
+        current.append(block)
+        current_size += addition
+    if current:
+        chunks.append("\n\n".join(current))
+    return chunks or [""]
+
+
+async def send_bilingual_lyrics(
+    message: Message,
+    heading: str,
+    original: str,
+    translation: str,
+    reply_markup=None,
+) -> list[Message]:
+    chunks = bilingual_lyrics_chunks(original, translation)
+    sent: list[Message] = []
+    for index, chunk in enumerate(chunks):
+        part = "" if index == 0 else f" — часть {index + 1}"
+        sent.append(
+            await message.answer(
+                f"<b>{html.escape(heading + part)}</b>\n\n{chunk}",
+                parse_mode="HTML",
+                reply_markup=reply_markup if index == len(chunks) - 1 else None,
+            )
+        )
+    return sent
+
+
+async def delete_lyrics_messages(track_id: str, current: Message | None = None) -> None:
+    messages = lyrics_messages.pop(track_id, [])
+    if current and all(item.message_id != current.message_id for item in messages):
+        messages.append(current)
+    for item in messages:
+        await delete_message_safely(item)
 
 
 @router.message(CommandStart())
@@ -787,7 +943,7 @@ async def request_lyrics(callback: CallbackQuery) -> None:
         lyrics = await fetch_lyrics(track["title"], track.get("artist"))
         if not lyrics:
             await status.edit_text(
-                "Текст не найден — возможно, это инструментал. Попробуйте выполнить новый поиск.",
+                "Текст этой песни пока не найден в LRCLIB. Проверьте название и исполнителя или попробуйте другой вариант композиции.",
                 reply_markup=InlineKeyboardMarkup(
                     inline_keyboard=[[InlineKeyboardButton(text="🔎 Новый поиск", callback_data="find_music")]]
                 ),
@@ -796,13 +952,13 @@ async def request_lyrics(callback: CallbackQuery) -> None:
         lyrics_cache[track_id] = lyrics
         await status.delete()
         if lyrics["language"] == "ru" or re.search(r"[А-Яа-яЁё]", lyrics["original"]):
-            await send_long_text(
+            lyrics_messages[track_id] = await send_long_text(
                 callback.message,
                 f"📝 {track['artist'] or ''} — {track['title']}",
                 f"{lyrics['original']}\n\n{lyrics['copyright']}",
             )
             return
-        await send_long_text(
+        lyrics_messages[track_id] = await send_long_text(
             callback.message,
             f"🇬🇧 {track['artist'] or ''} — {track['title']}",
             f"{lyrics['original']}\n\n{lyrics['copyright']}",
@@ -822,7 +978,8 @@ async def show_original_lyrics(callback: CallbackQuery) -> None:
     track = downloaded_tracks.get(track_id)
     if not callback.message or not lyrics or not track:
         return
-    await send_long_text(
+    await delete_lyrics_messages(track_id, callback.message)
+    lyrics_messages[track_id] = await send_long_text(
         callback.message,
         f"🇬🇧 {track.get('artist') or ''} — {track['title']}",
         f"{lyrics['original']}\n\n{lyrics['copyright']}",
@@ -843,9 +1000,11 @@ async def show_translated_lyrics(callback: CallbackQuery) -> None:
         if not lyrics.get("translation"):
             lyrics["translation"] = await translate_to_russian(lyrics["original"])
         await status.delete()
-        await send_long_text(
+        await delete_lyrics_messages(track_id, callback.message)
+        lyrics_messages[track_id] = await send_bilingual_lyrics(
             callback.message,
-            f"🇷🇺 {track.get('artist') or ''} — {track['title']}",
+            f"🇬🇧 🇷🇺 {track.get('artist') or ''} — {track['title']}",
+            lyrics["original"],
             lyrics["translation"],
             reply_markup=lyrics_switch_keyboard(track_id),
         )
