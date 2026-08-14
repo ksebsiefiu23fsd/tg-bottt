@@ -589,11 +589,17 @@ async def fetch_lyrics(title: str, artist: str | None) -> dict | None:
     body = lyrics_body(lyrics)
     return {
         "original": body,
-        "language": "ru" if re.search(r"[А-Яа-яЁё]", body) else "en",
+        "language": detect_lyrics_language(body),
         "copyright": "Источник текста: LRCLIB",
         "matched_title": lyrics.get("trackName"),
         "matched_artist": lyrics.get("artistName"),
     }
+
+
+def detect_lyrics_language(text: str) -> str:
+    latin_count = len(re.findall(r"[A-Za-z]", text))
+    cyrillic_count = len(re.findall(r"[А-Яа-яЁё]", text))
+    return "ru" if cyrillic_count > latin_count else "en"
 
 
 def clean_track_name(value: str) -> str:
@@ -951,7 +957,7 @@ async def request_lyrics(callback: CallbackQuery) -> None:
             return
         lyrics_cache[track_id] = lyrics
         await status.delete()
-        if lyrics["language"] == "ru" or re.search(r"[А-Яа-яЁё]", lyrics["original"]):
+        if lyrics["language"] == "ru":
             lyrics_messages[track_id] = await send_long_text(
                 callback.message,
                 f"📝 {track['artist'] or ''} — {track['title']}",
