@@ -672,7 +672,9 @@ def download_selected_track(
         "socket_timeout": 30,
         "format": "bestaudio/best",
         "retries": 5,
+        "fragment_retries": 5,
         "extractor_retries": 5,
+        "file_access_retries": 3,
         "outtmpl": str(target_dir / "track.%(ext)s"),
         "ffmpeg_location": ffmpeg_location(target_dir),
         "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}],
@@ -680,8 +682,26 @@ def download_selected_track(
         "progress_hooks": [cancellation_hook(cancel_event)],
         **site_download_options(url),
     }
-    with YoutubeDL(options) as ydl:
-        info = ydl.extract_info(url, download=True)
+    info: dict | None = None
+    for attempt in range(2):
+        try:
+            with YoutubeDL(options) as ydl:
+                info = ydl.extract_info(url, download=True)
+            break
+        except DownloadError:
+            if cancel_event.is_set() or attempt == 1:
+                raise
+            logging.warning("Track download failed; retrying with a fresh media URL")
+            for partial_file in target_dir.glob("track.*"):
+                try:
+                    partial_file.unlink()
+                except OSError:
+                    pass
+            if cancel_event.wait(1.5):
+                raise DownloadError("Операция отменена командой /start")
+
+    if info is None:
+        raise RuntimeError("Не удалось получить данные композиции.")
     output = target_dir / "track.mp3"
     if not output.exists():
         raise RuntimeError("Не удалось подготовить аудиофайл.")
