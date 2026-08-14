@@ -295,9 +295,13 @@ def cancellation_hook(cancel_event: threading.Event):
 
 
 def reset_user_session(user_id: int) -> None:
-    global active_cancel_event
+    global active_cancel_event, processing_lock
     if active_cancel_event:
         active_cancel_event.set()
+    if processing_lock.locked():
+        logging.info("Resetting media processing lock after /start")
+        processing_lock = asyncio.Lock()
+    active_cancel_event = None
     user_modes.pop(user_id, None)
     pending_video_urls.pop(user_id, None)
     downloaded_tracks.clear()
